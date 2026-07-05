@@ -14,9 +14,11 @@ to control the fan is to talk to the **Embedded Controller (EC)** directly. This
 does exactly that, safely and reversibly.
 
 > **TL;DR** — two EC registers control the fan:
-> `0x0A19` = enable/mode, `0x0A18` = speed. Writing both to `0` stops the fan.
-> The EC keeps trying to spin it back up, so a 1-second re-assert loop holds it
-> stopped while the CPU is cool, and releases it to automatic control when warm.
+> `0x0A19` = enable/mode, `0x0A18` = speed (**safe range 0–10 only**, see below).
+> Writing both to `0` stops the fan. The EC keeps trying to spin it back up, so a
+> 0.5-second re-assert loop holds it stopped while the CPU is cool, and hands it
+> back to automatic control above a temperature threshold — with a hysteresis gap
+> so it doesn't chatter right at that boundary.
 
 ---
 
@@ -52,26 +54,53 @@ We call them from userspace via the **`acpi_call`** kernel module (`/proc/acpi/c
 |---|---|---|
 | `0x0A00` / `0x0A01` | Fan0 RPM readback (hi/lo). `RPM = (0x0A00<<8) \| 0x0A01` | reads real RPM |
 | `0x0A04` | RPM ÷ 100 readback | 25 ↔ 2500 RPM |
-| **`0x0A18`** | **Fan speed / duty target** | writing 10 drove RPM 2513→3636 at constant temp |
-| **`0x0A19`** | **Fan enable / mode** | `0`→**stops (0 RPM)**, `1`→~1846, `85`→2331, `170`→2639 |
+| **`0x0A18`** | **Fan speed / duty target — safe range 0–10 only** | see calibration table below |
+| **`0x0A19`** | **Fan enable / mode**: `0`→disabled, `1`→enabled (obeys `0x0A18`) | `0`+`0x0A18=0`→**stops (0 RPM)** |
 | `0x0A08`,`0x0A0A`,`0x0A0B` | current-state readback (writes get overwritten) | not control inputs |
+| `0x0A70`–`0x0A8F` | ⚠️ **battery vendor/serial strings — never write** | not fan-related |
 
 **Stop the fan:** `WTER(0x0A19,0)` then `WTER(0x0A18,0)`.
 **Back to automatic:** `WTER(0x0A19,1)` then `WTER(0x0A18,3)` (or just reboot).
 
+#### Calibration table (`0x0A18`, with `0x0A19=1`, idle ~41 °C)
+
+| `0x0A18` | RPM |
+|---|---|
+| 0 | 0 (stopped) |
+| 1 | ~1763 |
+| 2 | ~1989 |
+| 3 | ~2216 |
+| 5 | ~2796 |
+| 8 | ~3477 |
+| 10 | ~3970 |
+
+`0x0A18` is monotonic and stable across **0–10**. Values at or above **16 do not give
+a higher steady speed** — they trigger the EC's own reset/ramp-restart behaviour
+instead (confirmed unstable at 16, 32, 128, and 255: the register briefly holds the
+written value, then the EC silently overwrites it back down and re-climbs through its
+own low-speed states on its own, with zero further writes from us). **Never command
+`0x0A18` outside 0–10.** Separately, stress-testing all cores under the EC's own
+factory automatic control peaked at **~3993 RPM at 100 °C** — essentially identical to
+our measured `0x0A18=10`, confirming 10 is the hardware's real ceiling, not an
+artificial cap.
+
 ### Why a loop is needed
 
 The EC runs its own temperature→fan curve in the background and slowly **servos the
-registers back** to its own targets. A single write only stops the fan for a few
-seconds. Re-asserting `0`/`0` about once per second holds it stopped. That is what
-`fan-hold.sh` / the systemd service do — and they hand control back to the EC above a
-temperature threshold so the machine always cools when it needs to.
+registers back** to its own targets — this holds regardless of what value you write,
+including out-of-range ones (see above), so there is no "sticky" value that the EC
+simply leaves alone. A single write only stops the fan for a few seconds. Re-asserting
+`0`/`0` every 0.5 s holds it stopped. That is what `fan-hold.sh` / the systemd service
+do — and they hand control back to the EC above a temperature threshold, releasing it
+again only once the CPU has cooled a further margin below that threshold (hysteresis),
+so the fan doesn't chatter on and off right at the boundary.
 
 ### Verified result
 
 At idle, holding `0x0A19=0 / 0x0A18=0` kept **Fan0 at 0 RPM for 37 of 40 s**, with the
-CPU rising only **43 → 45 °C** (Tjmax is 95 °C). Releasing restored automatic control
-and the fan spun back up normally.
+CPU rising only **43 → 45 °C** (Tjmax is **100 °C** — the CPU throttles to sit there
+safely under heavy load, by design). Releasing restored automatic control and the fan
+spun back up normally.
 
 ---
 
@@ -98,8 +127,11 @@ ls /proc/acpi/call        # should exist
 sudo bash scripts/read-ec.sh          # show fan RPM + registers
 sudo bash scripts/fan-stop.sh         # stop the fan once
 sudo bash scripts/fan-auto.sh         # give it back to automatic control
-sudo bash scripts/fan-hold.sh 60      # hold fan off while CPU < 60°C (Ctrl-C to release)
+sudo bash scripts/fan-hold.sh         # hold off < 65°C, auto >= 65°C, resumes holding only below 55°C
+sudo bash scripts/fan-hold.sh 60 5    # custom: auto at 60°C, resumes holding below 55°C
 ```
+
+`fan-hold.sh [ON_C] [HYST_C]` — Ctrl-C releases to auto immediately.
 
 ### 3. Optional: run it at boot (systemd)
 
@@ -108,7 +140,7 @@ sudo install -m 755 scripts/fan-hold.sh /usr/local/bin/honor-fan-hold
 sudo install -m 644 systemd/honor-fan.service /etc/systemd/system/honor-fan.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now honor-fan.service
-# edit the "60" in the service file to change the temperature threshold
+# edit the "65 10" args in the service file's ExecStart to change the thresholds
 ```
 
 Stop/undo:
@@ -126,9 +158,15 @@ sudo systemctl disable --now honor-fan.service   # ExecStopPost returns fan to a
 | `scripts/setup-acpi-call.sh` | install + (if needed) sign & enroll `acpi_call` | no |
 | `scripts/read-ec.sh` | print fan RPM and key registers | no |
 | `scripts/correlate.sh` | idle/load/cooldown scan to **find** the fan registers | no |
+| `scripts/watch-rpm.sh [SECS]` | read-only RPM+temp monitor, tracks peak (EC auto stays in charge) | no |
+| `scripts/stress-peak.sh [SECS] [ABORT_C]` | load all cores, read-only, to measure the factory max fan speed | no |
+| `scripts/probe-value.sh REG VAL [SECS] [CEIL_C]` | hold one (register,value) and re-assert it every second, printing RPM — confirms a *steady-state* value vs. a transient | yes |
+| `scripts/probe-sticky.sh REG VAL [SECS] [CEIL_C]` | write a value **once**, then only read — reveals whether the EC drifts it away on its own (used to rule out "sticky" special values) | yes |
 | `scripts/fan-stop.sh` | stop the fan once | yes |
 | `scripts/fan-auto.sh` | return the fan to automatic control | yes |
-| `scripts/fan-hold.sh` | temperature-safe loop that holds the fan stopped | yes |
+| `scripts/fan-hold.sh [ON_C] [HYST_C]` | temperature-safe loop, holds the fan stopped with a hysteresis band | yes |
+| `scripts/calibrate-curve.sh` | early sweep script; superseded by `probe-value.sh`/`probe-sticky.sh` (its rapid-sweep sampling produced misleading transients) — kept for reference only | yes |
+| `scripts/fan-curve.sh` | experimental multi-step temperature→duty curve (smoother ramp than the on/off model above); not the recommended/installed script, kept as a documented alternative | yes |
 
 ## Adapting to another HONOR model
 
