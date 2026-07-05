@@ -165,8 +165,6 @@ sudo systemctl disable --now honor-fan.service   # ExecStopPost returns fan to a
 | `scripts/fan-stop.sh` | stop the fan once | yes |
 | `scripts/fan-auto.sh` | return the fan to automatic control | yes |
 | `scripts/fan-hold.sh [ON_C] [HYST_C]` | temperature-safe loop, holds the fan stopped with a hysteresis band | yes |
-| `scripts/calibrate-curve.sh` | early sweep script; superseded by `probe-value.sh`/`probe-sticky.sh` (its rapid-sweep sampling produced misleading transients) — kept for reference only | yes |
-| `scripts/fan-curve.sh` | experimental multi-step temperature→duty curve (smoother ramp than the on/off model above); not the recommended/installed script, kept as a documented alternative | yes |
 
 ## Adapting to another HONOR model
 
