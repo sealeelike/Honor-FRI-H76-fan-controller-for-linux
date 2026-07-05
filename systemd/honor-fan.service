@@ -1,0 +1,16 @@
+[Unit]
+Description=HONOR FRI-H76 quiet fan control (hold zero-RPM below a temp threshold)
+After=multi-user.target
+
+[Service]
+Type=simple
+# ensure the EC bridge is present
+ExecStartPre=/sbin/modprobe acpi_call
+# hold the fan off while CPU < 60C, auto above that. Edit the number to taste.
+ExecStart=/usr/local/bin/honor-fan-hold 60
+# on stop, hand the fan back to the EC's automatic control
+ExecStopPost=/bin/sh -c 'echo "\\_SB.PCI0.LPC0.EC0.WTER 0x0A19 0x01" > /proc/acpi/call; echo "\\_SB.PCI0.LPC0.EC0.WTER 0x0A18 0x03" > /proc/acpi/call'
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
